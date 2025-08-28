@@ -1,20 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:network_info_plus/network_info_plus.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const SmartSecurityApp());
 }
 
-/// 👉 Set this to your ESP32's IP (static) or mDNS host if you’ve set up MDNS.
-/// Examples: "http://192.168.1.72:80" or "http://esp32.local"
-const String ESP_BASE_URL = "http://192.168.4.1"; // TODO: change this
+const String ESP_IP = "10.160.145.186";
+const int ESP_PORT = 80;
 
 class SmartSecurityApp extends StatelessWidget {
   const SmartSecurityApp({super.key});
@@ -38,8 +34,8 @@ class SmartSecurityApp extends StatelessWidget {
 class AlarmRecord {
   final String id;
   final DateTime timestamp;
-  final String reason; // e.g., "Away mode armed"
-  final String type;   // "away" or "security"
+  final String reason;
+  final String type;
 
   AlarmRecord({
     required this.id,
@@ -47,53 +43,6 @@ class AlarmRecord {
     required this.reason,
     required this.type,
   });
-
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'timestamp': timestamp.toIso8601String(),
-    'reason': reason,
-    'type': type,
-  };
-
-  factory AlarmRecord.fromJson(Map<String, dynamic> json) => AlarmRecord(
-    id: json['id'] as String,
-    timestamp: DateTime.parse(json['timestamp'] as String),
-    reason: json['reason'] as String,
-    type: json['type'] as String,
-  );
-}
-
-class ApiService {
-  final String baseUrl;
-  ApiService(this.baseUrl);
-
-  Future<bool> setAway(bool enabled) async {
-    final res = await http.post(
-      Uri.parse('$baseUrl/api/away'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'enabled': enabled}),
-    );
-    return res.statusCode >= 200 && res.statusCode < 300;
-  }
-
-  Future<bool> setSecurity(bool enabled) async {
-    final res = await http.post(
-      Uri.parse('$baseUrl/api/security'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'enabled': enabled}),
-    );
-    return res.statusCode >= 200 && res.statusCode < 300;
-  }
-
-  Future<Map<String, dynamic>?> getStatus() async {
-    try {
-      final res = await http.get(Uri.parse('$baseUrl/api/status'));
-      if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
-      }
-    } catch (_) {}
-    return null;
-  }
 }
 
 class SecurityHome extends StatefulWidget {
@@ -105,139 +54,75 @@ class SecurityHome extends StatefulWidget {
 
 class _SecurityHomeState extends State<SecurityHome>
     with SingleTickerProviderStateMixin {
-  late final ApiService _api;
   late final TabController _tab;
-  final _prefsFuture = SharedPreferences.getInstance();
-
-  // UI state
-  bool isWiFiConnected = false;
-  String? ssid;
-  bool awayModeActive = false;
-  bool securityModeActive = false;
   List<AlarmRecord> alarmHistory = [];
 
-  // Wi-Fi watchers
-  StreamSubscription<ConnectivityResult>? _connSub;
-  final _info = NetworkInfo();
+  bool awayModeActive = false;
+  bool securityModeActive = false;
+  String lastMessage = "System Ready";
+
+  Socket? _socket;
 
   @override
   void initState() {
     super.initState();
-    _api = ApiService(ESP_BASE_URL);
     _tab = TabController(length: 3, vsync: this);
-
-    _loadHistory();
-    _initConnectivityWatch();
-    _fetchEspStatus(); // try to sync with device on start
+    _connectToEsp();
   }
 
   @override
   void dispose() {
-    _connSub?.cancel();
     _tab.dispose();
+    _socket?.destroy();
     super.dispose();
   }
 
-  Future<void> _loadHistory() async {
-    final prefs = await _prefsFuture;
-    final raw = prefs.getStringList('alarmHistory') ?? [];
-    setState(() {
-      alarmHistory = raw
-          .map((s) => AlarmRecord.fromJson(jsonDecode(s) as Map<String, dynamic>))
-          .toList();
-    });
+  Future<void> _connectToEsp() async {
+    try {
+      _socket = await Socket.connect(ESP_IP, ESP_PORT);
+      _socket!.listen((data) {
+        final msg = utf8.decode(data).trim();
+        setState(() => lastMessage = msg);
+        _addAlertToHistory(msg);
+      }, onDone: () {
+        print("Disconnected from ESP");
+      }, onError: (e) {
+        print("Socket error: $e");
+      });
+    } catch (e) {
+      print("Failed to connect: $e");
+    }
   }
 
-  Future<void> _saveHistory() async {
-    final prefs = await _prefsFuture;
-    final raw = alarmHistory.map((r) => jsonEncode(r.toJson())).toList();
-    await prefs.setStringList('alarmHistory', raw);
+  void _sendCommand(String cmd) {
+    _socket?.write(cmd + '\n');
   }
 
-  void addAlarmRecord(String reason, String type) {
+  void _addAlertToHistory(String msg) {
     setState(() {
       alarmHistory.add(AlarmRecord(
         id: DateTime.now().microsecondsSinceEpoch.toString(),
         timestamp: DateTime.now(),
-        reason: reason,
-        type: type,
+        reason: msg,
+        type: msg.contains("Away") ? "away" : "security",
       ));
     });
-    _saveHistory();
   }
 
   void clearAlarmHistory() {
     setState(() => alarmHistory.clear());
-    _saveHistory();
-  }
-
-  void _initConnectivityWatch() async {
-    await _updateConnectivityOnce();
-    _connSub = Connectivity().onConnectivityChanged.listen((result) async {
-      await _updateConnectivityOnce();
-    });
-  }
-
-  Future<void> _updateConnectivityOnce() async {
-    final connectivity = Connectivity();
-    final result = await Connectivity().checkConnectivity();
-    final connected = (result == ConnectivityResult.wifi) ||
-        (result == ConnectivityResult.ethernet);
-    String? currentSsid;
-    if (connected) {
-      try {
-        currentSsid = await _info.getWifiName();
-      } catch (_) {}
-    }
-    setState(() {
-      isWiFiConnected = connected;
-      ssid = currentSsid;
-    });
-  }
-
-  Future<void> _fetchEspStatus() async {
-    final status = await _api.getStatus();
-    if (status != null && mounted) {
-      setState(() {
-        awayModeActive = (status['away'] == true);
-        securityModeActive = (status['security'] == true);
-      });
-    }
   }
 
   Future<void> _toggleAway(bool val) async {
-    if (!isWiFiConnected) {
-      _toast('Not connected to Wi-Fi');
-      return;
-    }
-    final ok = await _api.setAway(val);
-    if (!ok) {
-      _toast('Failed to update Away mode on device');
-      return;~~~~~
-    }
+    _sendCommand(val ? "CMD:AWAY_ON" : "CMD:AWAY_OFF");
     setState(() => awayModeActive = val);
-    addAlarmRecord(val ? "Away mode armed" : "Away mode disarmed", "away");
+    _addAlertToHistory(val ? "Away mode armed" : "Away mode disarmed");
   }
 
   Future<void> _toggleSecurity(bool val) async {
-    if (!isWiFiConnected) {
-      _toast('Not connected to Wi-Fi');
-      return;
-    }
-    final ok = await _api.setSecurity(val);
-    if (!ok) {
-      _toast('Failed to update Security mode on device');
-      return;
-    }
+    _sendCommand(val ? "CMD:SEC_ON" : "CMD:SEC_OFF");
     setState(() => securityModeActive = val);
-    addAlarmRecord(val ? "Security mode armed" : "Security mode disarmed", "security");
-  }
-
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg)),
-    );
+    _addAlertToHistory(val ? "Security mode armed" : "Security mode disarmed");
   }
 
   @override
@@ -258,11 +143,17 @@ class _SecurityHomeState extends State<SecurityHome>
       body: TabBarView(
         controller: _tab,
         children: [
-          AwayMode(
+          ModeCard(
+            icon: Icons.shield,
+            title: "Away Mode",
+            description: "We are Home safe baby.",
             isActive: awayModeActive,
             onToggle: _toggleAway,
           ),
-          SecurityMode(
+          ModeCard(
+            icon: Icons.warning,
+            title: "Security Mode",
+            description: "Za okuba zija.",
             isActive: securityModeActive,
             onToggle: _toggleSecurity,
           ),
@@ -278,22 +169,18 @@ class _SecurityHomeState extends State<SecurityHome>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // improved status colors
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                StatusIndicator(label: "Wi-Fi", active: isWiFiConnected, color: Colors.green),
                 StatusIndicator(label: "Away", active: awayModeActive, color: Colors.blue),
                 StatusIndicator(label: "Security", active: securityModeActive, color: Colors.orange),
               ],
             ),
             const SizedBox(height: 6),
-            // show SSID if available
             Text(
-              isWiFiConnected
-                  ? (ssid == null ? "Connected" : "Connected to $ssid")
-                  : "Not connected",
+              lastMessage,
               style: const TextStyle(fontSize: 12, color: Colors.white70),
+              textAlign: TextAlign.center,
             ),
           ],
         ),
@@ -302,11 +189,21 @@ class _SecurityHomeState extends State<SecurityHome>
   }
 }
 
-class AwayMode extends StatelessWidget {
+class ModeCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String description;
   final bool isActive;
   final Future<void> Function(bool) onToggle;
 
-  const AwayMode({super.key, required this.isActive, required this.onToggle});
+  const ModeCard({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.description,
+    required this.isActive,
+    required this.onToggle,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -322,72 +219,20 @@ class AwayMode extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.shield, size: 80, color: isActive ? Colors.redAccent : Colors.grey),
+                  Icon(icon, size: 80, color: isActive ? Colors.redAccent : Colors.grey),
                   const SizedBox(height: 16),
                   Text(
-                    isActive ? "Away Mode Active" : "Away Mode Inactive",
+                    isActive ? "$title Active" : "$title Inactive",
                     style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
                   ),
                   const SizedBox(height: 18),
                   SwitchListTile(
                     value: isActive,
                     onChanged: (val) => onToggle(val),
-                    title: const Text("Enable Away Mode"),
+                    title: Text("Enable $title"),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    "When enabled, motion/entry sensors trigger alarms while you’re out.",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white70),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class SecurityMode extends StatelessWidget {
-  final bool isActive;
-  final Future<void> Function(bool) onToggle;
-
-  const SecurityMode({super.key, required this.isActive, required this.onToggle});
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 420),
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Card(
-            elevation: 2,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 28.0, horizontal: 20),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.warning, size: 80, color: isActive ? Colors.orange : Colors.grey),
-                  const SizedBox(height: 16),
-                  Text(
-                    isActive ? "Security Mode Active" : "Security Mode Inactive",
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                  ),
-                  const SizedBox(height: 18),
-                  SwitchListTile(
-                    value: isActive,
-                    onChanged: (val) => onToggle(val),
-                    title: const Text("Enable Security Mode"),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "General security arming (e.g., perimeter sensors).",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white70),
-                  ),
+                  Text(description, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
                 ],
               ),
             ),
@@ -406,9 +251,7 @@ class AlarmHistoryView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (history.isEmpty) {
-      return const Center(child: Text("No alarms recorded"));
-    }
+    if (history.isEmpty) return const Center(child: Text("No alarms recorded"));
     final fmt = DateFormat("yyyy-MM-dd HH:mm:ss");
     return Column(
       children: [

@@ -1,16 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:intl/intl.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const SmartSecurityApp());
 }
-
-const String ESP_IP = "10.160.145.186";
-const int ESP_PORT = 80;
 
 class SmartSecurityApp extends StatelessWidget {
   const SmartSecurityApp({super.key});
@@ -59,43 +56,50 @@ class _SecurityHomeState extends State<SecurityHome>
 
   bool awayModeActive = false;
   bool securityModeActive = false;
+  bool safeModeActive = false; // 🔹 New Safe mode state
   String lastMessage = "System Ready";
 
-  Socket? _socket;
+  BluetoothConnection? _connection;
 
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 3, vsync: this);
-    _connectToEsp();
+    _connectToArduino();
   }
 
   @override
   void dispose() {
     _tab.dispose();
-    _socket?.destroy();
+    _connection?.dispose();
     super.dispose();
   }
 
-  Future<void> _connectToEsp() async {
+  Future<void> _connectToArduino() async {
     try {
-      _socket = await Socket.connect(ESP_IP, ESP_PORT);
-      _socket!.listen((data) {
-        final msg = utf8.decode(data).trim();
-        setState(() => lastMessage = msg);
-        _addAlertToHistory(msg);
-      }, onDone: () {
-        print("Disconnected from ESP");
-      }, onError: (e) {
-        print("Socket error: $e");
+      // Change HC-05 MAC Address to yours
+      String address = "00:21:13:00:55:10";
+      BluetoothConnection.toAddress(address).then((_conn) {
+        _connection = _conn;
+        print("Connected to Arduino");
+
+        _connection!.input!.listen((data) {
+          final msg = utf8.decode(data).trim();
+          setState(() => lastMessage = msg);
+          _addAlertToHistory(msg);
+        }).onDone(() {
+          print("Disconnected from Arduino");
+        });
       });
     } catch (e) {
-      print("Failed to connect: $e");
+      print("Bluetooth connection failed: $e");
     }
   }
 
   void _sendCommand(String cmd) {
-    _socket?.write(cmd + '\n');
+    if (_connection != null && _connection!.isConnected) {
+      _connection!.output.add(utf8.encode(cmd + "\n"));
+    }
   }
 
   void _addAlertToHistory(String msg) {
@@ -104,7 +108,11 @@ class _SecurityHomeState extends State<SecurityHome>
         id: DateTime.now().microsecondsSinceEpoch.toString(),
         timestamp: DateTime.now(),
         reason: msg,
-        type: msg.contains("Away") ? "away" : "security",
+        type: msg.contains("Away")
+            ? "away"
+            : msg.contains("Security")
+            ? "security"
+            : "safe",
       ));
     });
   }
@@ -123,6 +131,12 @@ class _SecurityHomeState extends State<SecurityHome>
     _sendCommand(val ? "CMD:SEC_ON" : "CMD:SEC_OFF");
     setState(() => securityModeActive = val);
     _addAlertToHistory(val ? "Security mode armed" : "Security mode disarmed");
+  }
+
+  Future<void> _toggleSafe(bool val) async {
+    _sendCommand(val ? "1" : "0");
+    setState(() => safeModeActive = val);
+    _addAlertToHistory(val ? "Safe mode enabled" : "Safe mode disabled");
   }
 
   @override
@@ -174,6 +188,7 @@ class _SecurityHomeState extends State<SecurityHome>
               children: [
                 StatusIndicator(label: "Away", active: awayModeActive, color: Colors.blue),
                 StatusIndicator(label: "Security", active: securityModeActive, color: Colors.orange),
+                StatusIndicator(label: "Safe", active: safeModeActive, color: Colors.green), // 🔹 New Safe status
               ],
             ),
             const SizedBox(height: 6),
@@ -181,6 +196,12 @@ class _SecurityHomeState extends State<SecurityHome>
               lastMessage,
               style: const TextStyle(fontSize: 12, color: Colors.white70),
               textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            SwitchListTile(
+              value: safeModeActive,
+              onChanged: _toggleSafe,
+              title: const Text("Enable Safe Mode"),
             ),
           ],
         ),
@@ -261,8 +282,16 @@ class AlarmHistoryView extends StatelessWidget {
             separatorBuilder: (_, __) => const Divider(height: 1),
             itemBuilder: (context, i) {
               final r = history[i];
-              final icon = r.type == "away" ? Icons.shield : Icons.security;
-              final color = r.type == "away" ? Colors.blue : Colors.orange;
+              final icon = r.type == "away"
+                  ? Icons.shield
+                  : r.type == "security"
+                  ? Icons.security
+                  : Icons.lock;
+              final color = r.type == "away"
+                  ? Colors.blue
+                  : r.type == "security"
+                  ? Colors.orange
+                  : Colors.green;
               return ListTile(
                 leading: Icon(icon, color: color),
                 title: Text(r.reason),
